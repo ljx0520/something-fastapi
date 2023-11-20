@@ -1,0 +1,4 @@
+GCP_PROJECT: org-playground
+SERVICE_NAME: Something FastAPI DEV
+
+# secret env vars are set from Cloud Secrets in the Github Actions

@@ -1,0 +1,4 @@
+GCP_PROJECT: something-fastapi-405711
+SERVICE_NAME: Something FastAPI
+
+# secret env vars are set from Cloud Secrets in the Github Actions

@@ -1,0 +1,122 @@
+name: something-fastapi
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Deploy {0} @ {1}', inputs.environment, inputs.git_ref || github.ref	) || '' }}
+
+on:
+  # if triggered by merging into main, it deploys to PLAY
+  push:
+    branches:
+      - main
+    paths:
+      - something-fastapi/something-fastapi/**
+      # updating production env-config by itself should not trigger a playground deployment
+      - "!something-fastapi/something-fastapi/envs/something-fastapi-405711.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment
+        type: choice
+        required: true
+        default: PLAY
+        options:
+          - PLAY
+          - PROD
+      git_ref:
+        description: Commit SHA
+        type: string
+        required: false
+
+env:
+  # We are on GitHub Teams so no environment protection rules, hence we need to
+  # make production deployment to be a workflow_dispatch, instead of a matrix strategy
+  environments: |
+    {
+      "PLAY": {
+        "gcp_project": "org-playground",
+        "workload_identity_provider": "projects/641705793680/locations/global/workloadIdentityPools/github/providers/github-provider",
+        "build_image": "us-central1-docker.pkg.dev/org-playground/something-fastapi/something-fastapi"
+      },
+      "PROD": {
+        "gcp_project": "something-fastapi-405711",
+        "workload_identity_provider": "projects/45004180354/locations/global/workloadIdentityPools/github/providers/github-provider",
+        "build_image": "us-central1-docker.pkg.dev/something-fastapi-405711/something-fastapi/something-fastapi"
+      }
+    }
+  # default to PLAY for push events
+  active_environment: ${{ inputs.environment || 'PLAY' }}
+  secret_env_vars: |
+    SECRET=something-fastapi-secret:latest
+  
+
+jobs:
+  # TODO lint
+  # TODO test
+
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    # doesn't support use of ${{ env.active_environment }} :(
+    environment: something-fastapi ${{ inputs.environment || 'PLAY' }}
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: ${{ inputs.git_ref || github.ref }}
+
+      - uses: docker/setup-buildx-action@v2
+
+      - id: context
+        run: |
+          echo "gcp_project=${{ fromJSON(env.environments)[env.active_environment].gcp_project }}" >> $GITHUB_ENV
+          echo "workload_identity_provider=${{ fromJSON(env.environments)[env.active_environment].workload_identity_provider }}" >> $GITHUB_ENV
+          echo "build_image=${{ fromJSON(env.environments)[env.active_environment].build_image }}" >> $GITHUB_ENV
+
+      - id: google_auth
+        uses: google-github-actions/auth@v1
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ env.workload_identity_provider }}
+          service_account: github-action@${{ env.gcp_project }}.iam.gserviceaccount.com
+
+      - uses: docker/login-action@v2
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.google_auth.outputs.access_token }}
+
+      - id: version
+        run: |
+          VERSION=$(git rev-parse --short HEAD)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Images:" >> $GITHUB_STEP_SUMMARY
+          echo "* ${{ env.build_image }}:$VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "* ${{ env.build_image }}:latest" >> $GITHUB_STEP_SUMMARY
+
+      - uses: docker/build-push-action@v4
+        with:
+          context: ./something-fastapi
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ env.build_image }}:${{ steps.version.outputs.version }}
+            ${{ env.build_image }}:latest
+
+      - uses: google-github-actions/setup-gcloud@v1
+        with:
+          install_components: beta
+      - run: |
+          SECRETS_ARRAY=(${{ env.secret_env_vars }})
+          SECRETS=$(IFS=,; echo "${SECRETS_ARRAY[*]}")
+
+          gcloud run deploy something-fastapi \
+            --image ${{ env.build_image }}:${{ steps.version.outputs.version }} \
+            --platform managed \
+            --region us-central1 \
+            --service-account something-fastapi@${{ env.gcp_project }}.iam.gserviceaccount.com \
+            --allow-unauthenticated \
+            --env-vars-file ./envs/${{ env.gcp_project }}.yml \
+            --set-secrets "$SECRETS"
+        working-directory: ./something-fastapi
